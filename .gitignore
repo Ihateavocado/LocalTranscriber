@@ -27,3 +27,4 @@ hf_cache/
 *.key
 models/
 .cache/
+.venv-diar/
