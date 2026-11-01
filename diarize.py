@@ -1,4 +1,4 @@
-"""Local speaker diarization test using pyannote Community-1 (CPU).
+"""Local speaker diarization using pyannote Community-1 (CPU or CUDA).
 
 Run with the project's .venv-diar Python environment.
 Audio stays on the local computer; Hugging Face is used to download the model.
@@ -15,6 +15,19 @@ from pathlib import Path
 # Set these BEFORE importing pyannote / huggingface_hub.
 os.environ["PYANNOTE_METRICS_ENABLED"] = "0"
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+
+# On Windows, TorchCodec needs access to the compatible FFmpeg Shared DLLs.
+# This must run before importing pyannote / torchcodec. Keep the handle alive.
+FFMPEG_DLL_HANDLE = None
+ffmpeg_dir = os.environ.get("FFMPEG_DLL_DIR", "").strip()
+if not ffmpeg_dir:
+    candidate = Path(__file__).resolve().parent / "tools" / "ffmpeg7" / "ffmpeg-7.1.1-full_build-shared" / "bin"
+    if candidate.is_dir():
+        ffmpeg_dir = str(candidate)
+if ffmpeg_dir and os.path.isdir(ffmpeg_dir):
+    os.environ["PATH"] = ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
+    if os.name == "nt":
+        FFMPEG_DLL_HANDLE = os.add_dll_directory(ffmpeg_dir)
 
 
 def timestamp(seconds: float) -> str:
@@ -33,9 +46,10 @@ def segments(annotation):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Local CPU diarization test")
+    parser = argparse.ArgumentParser(description="Local speaker diarization (CPU / CUDA)")
     parser.add_argument("--input", default="output/benchmark_clip.wav")
     parser.add_argument("--num-speakers", type=int, default=2, help="0 = detect automatically")
+    parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     parser.add_argument("--output-prefix", default="output/diarization_test")
     parser.add_argument("--non-interactive", action="store_true", help="Read HF_TOKEN from environment or local HF login; do not prompt")
     args = parser.parse_args()
@@ -69,7 +83,11 @@ def main():
         print("Check Hugging Face model access, token permissions and internet connection.")
         raise SystemExit(1) from None
     del token
-    pipeline.to(torch.device("cpu"))
+    if args.device == "cuda" and not torch.cuda.is_available():
+        raise SystemExit("CUDA selected, but PyTorch cannot access an NVIDIA GPU")
+    pipeline.to(torch.device(args.device))
+    if args.device == "cuda":
+        torch.cuda.synchronize()
     load_seconds = time.perf_counter() - started
     print(f"Model ready: {load_seconds:.1f} s", flush=True)
 
@@ -77,6 +95,8 @@ def main():
     print(f"Analyzing: {audio_path.name}", flush=True)
     pipeline_args = {"num_speakers": args.num_speakers} if args.num_speakers else {}
     result = pipeline(str(audio_path), **pipeline_args)
+    if args.device == "cuda":
+        torch.cuda.synchronize()
     run_seconds = time.perf_counter() - started
 
     all_turns = segments(result.speaker_diarization)
@@ -88,6 +108,7 @@ def main():
     prefix.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "audio": audio_path.name,
+        "device": args.device,
         "expected_speakers": args.num_speakers,
         "detected_speakers": len(speaker_ids),
         "model_load_seconds": round(load_seconds, 2),
@@ -109,7 +130,7 @@ def main():
 
     print(f"Detected speakers: {len(speaker_ids)}")
     print(f"Intervals: {len(exclusive_turns)}")
-    print(f"Model load: {load_seconds:.1f} s; diarization: {run_seconds:.1f} s")
+    print(f"Device: {args.device}; model load: {load_seconds:.1f} s; diarization: {run_seconds:.1f} s")
     print(f"Saved: {txt_path} and {json_path}")
 
 
